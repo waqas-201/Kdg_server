@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import prisma from "@/lib/prisma";
-import { GoogleGenAI } from "@google/genai";
+import { apps } from "@/db/schema"; // Your apps table definition
+import { inArray, eq } from "drizzle-orm";
 import { classifiedApps } from "@/services/clisssifier";
+import { db } from "@/db/db";
 
 // --------------------- TYPES ---------------------
 interface AppInput {
@@ -16,113 +17,89 @@ export interface AppResult {
   minAge: number | null;
 }
 
-
-
-
 export async function POST(request: NextRequest) {
-  console.log("Inside check route");
+  try {
+    const body: { appNames: AppInput[] } = await request.json();
+    const { appNames } = body;
 
-  const body: { appNames: AppInput[] } = await request.json();
-  const { appNames } = body;
+    if (!appNames || !Array.isArray(appNames)) {
+      return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
+    }
 
-  if (!appNames || !Array.isArray(appNames)) {
-    return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
-  }
+    const packageNames = appNames.map((a) => a.packageName);
 
-  // ---------------------------------------
-  // 1. Split: Check DB cache
-  // ---------------------------------------
-  const cachedApps: AppResult[] = [];
-  const appsToClassify: AppInput[] = [];
+    // ---------------------------------------
+    // 1. Check DB Cache (ONE QUERY, NOT A LOOP)
+    // ---------------------------------------
+    const cachedApps = await db
+      .select()
+      .from(apps)
+      .where(inArray(apps.packageName, packageNames));
 
-  for (const app of appNames) {
-    const record = await prisma.app.findUnique({
-      where: { packageName: app.packageName }
+    const cachedPackageNames = new Set(cachedApps.map((a) => a.packageName));
+
+    // Identify which apps are missing from the cache
+    const appsToClassify = appNames.filter(
+      (app) => !cachedPackageNames.has(app.packageName)
+    );
+
+    console.log("Apps already cached:", cachedApps.length);
+    console.log("Apps needing classification:", appsToClassify.length);
+
+    // ---------------------------------------
+    // 2. Classify missing apps
+    // ---------------------------------------
+    let newlyClassified: AppResult[] = [];
+
+    if (appsToClassify.length > 0) {
+      const result = await classifiedApps(appsToClassify);
+
+      if (!result) {
+        return NextResponse.json({ error: "Classifier failed" }, { status: 500 });
+      }
+
+      newlyClassified = result;
+
+      // ---------------------------------------
+      // 3. Save to DB (BULK UPSERT)
+      // ---------------------------------------
+      await upsertApps(newlyClassified);
+    }
+
+    // ---------------------------------------
+    // 4. Merge and Filter
+    // ---------------------------------------
+    const finalApps = [...cachedApps, ...newlyClassified];
+    const kidSafeApps = finalApps.filter((app) => app.isKidSafe);
+
+    return NextResponse.json({
+      message: "Classification completed",
+      apps: kidSafeApps,
     });
 
-    if (record) {
-      cachedApps.push({
-        packageName: record.packageName,
-        appName: record.appName,
-        isKidSafe: record.isKidSafe,
-        minAge: record.minAge,
-      });
-    } else {
-      appsToClassify.push(app);
-    }
-  }
-
-  console.log("Apps already cached:", cachedApps.length);
-  console.log("Apps needing classification:", appsToClassify.length);
-
-  // ---------------------------------------
-  // 2. Only classify missing apps
-  // ---------------------------------------
-  let classified: AppResult[] = [];
-
-  if (appsToClassify.length > 0) {
-
-    const result = await classifiedApps(appsToClassify);
-
-    if (!result) {
-      return NextResponse.json({ error: "Classifier failed" }, { status: 500 });
-    }
-
-    classified = result;
-
-    // ---------------------------------------
-    // 3. Save classifier results to DB cache
-    // ---------------------------------------
-    await upsertApps(classified);
-  }
-
-  // ---------------------------------------
-  // 4. Merge: cached + newly classified
-  // ---------------------------------------
-  const finalApps = [...cachedApps, ...classified];
-
-  // console.log("Total returned to client:", finalApps);
-
-  const kidSafeApps = finalApps.filter(app => app.isKidSafe);
-
-
-
-  return NextResponse.json({
-    message: "Classification completed",
-    apps: kidSafeApps,
-  });
-}
-
-
-
-
-async function upsertApps(appsList: AppResult[]) {
-  try {
-    await prisma.$transaction(
-      appsList.map((app) =>
-        prisma.app.upsert({
-          where: { packageName: app.packageName },
-          update: {
-            appName: app.appName,
-            isKidSafe: app.isKidSafe,
-            minAge: app.minAge,
-          },
-          create: {
-            packageName: app.packageName,
-            appName: app.appName,
-            isKidSafe: app.isKidSafe,
-            minAge: app.minAge,
-          },
-        })
-      )
-    );
   } catch (error) {
-    console.error("Prisma upsert error:", error);
+    console.error("Route Error:", error);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
   }
 }
 
+/**
+ * Bulk Upsert: This is much faster .
+ * It sends ONE command to PostgreSQL.
+ */
+async function upsertApps(appsList: AppResult[]) {
+  if (appsList.length === 0) return;
 
-const checkDbCout = async () => {
-  const count = await prisma.app.findMany();
-  console.log("Total apps in DB:", count.length);
+  await db
+    .insert(apps)
+    .values(appsList)
+    .onConflictDoUpdate({
+      target: apps.packageName, // The unique column
+      set: {
+        appName: apps.appName,
+        isKidSafe: apps.isKidSafe,
+        minAge: apps.minAge,
+      },
+    });
 }
+
